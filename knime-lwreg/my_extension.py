@@ -299,98 +299,76 @@ class LWRegQueryNode:
 )
 @knext.input_table(
     name="Input Registry IDs",
-    description="Input table containing molregnos (and optional conf_ids) to retrieve.",
+    description="Input table containing molregnos (and conf_ids if applicable) to retrieve.",
 )
 @knext.output_table(
     name="Retrieved Molecules",
-    description="Outputs the retrieved molecules with their molregno and conf_id (if applicable).",
+    description="Outputs the retrieved molecules with their molregno (and conf_id if applicable).",
 )
-class LWRegRetrieveNode:
-    """Retrieve from the LWReg database.
-    Retrieve molecules from the LWReg database using registry IDs as input.
-    """
+class LWRegRetrieveNode(knext.PythonNode):
+    """Retrieve molecules or structures from the LWReg database."""
 
-    # Database path
     db_path_input = knext.StringParameter(
         label="Database Path",
         description="Specify the path to the LWREG database file.",
-        default_value="C:/path/to/your/lwreg_database.sqlt",
+        default_value="lwreg.sqlt",
+    )
+    molregno_column = knext.ColumnParameter(
+        label="molregno Column",
+        description="Column name containing molregnos",
+        port_index=0,
+    )
+    conf_id_colunmn = knext.ColumnParameter(
+        label="conf_id Column",
+        description="Column name containing conf_ids, if not applicable, leave empty",
+        port_index=0,
     )
 
-    # Optionally choose to retrieve data as submitted
-    as_submitted = knext.BoolParameter(
-        label="Retrieve as submitted",
-        description="If checked, retrieves the structure as originally submitted.",
-        default_value=False,
-    )
-
-    def configure(self, configure_context, input_schema):
-        # Define the output schema
+    def configure(self, *args):
         output_schema = knext.Schema.from_columns(
             [
-                knext.Column(knext.double(), "Molregno"),  # Molregno will be a double
-                knext.Column(
-                    knext.double(), "Conf_ID"
-                ),  # Conf_ID will be a double, optional but always present in schema
-                knext.Column(
-                    knext.string(), "Molecule Data"
-                ),  # Molecule Data will be a string
+                knext.Column(knext.double(), "molregno"),
+                knext.Column(knext.double(), "conf_id"),
+                knext.Column(knext.string(), "Molecule Data"),
             ]
         )
         return output_schema
 
     def execute(self, exec_context, input_table):
         exec_context.set_progress(0.0, "Retrieving molecules from LWReg...")
-
-        # Set up the database connection using the provided path
-        lwreg.set_default_config({"dbname": self.db_path_input, "dbtype": "sqlite3"})
-
-        # Convert input_table to pandas DataFrame
+        config = lwreg.configure_from_database(dbname=self.db_path_input)
         input_df = input_table.to_pandas()
 
-        # Prepare the IDs for retrieval
-        ids = []
-        if "Conf_ID" in input_df.columns:
-            # Extract Molregno and Conf_ID from DataFrame, flattening tuples
+        if self.conf_id_colunmn is not None:
             ids = [
-                (
-                    (int(row["Molregno"]), int(row["Conf_ID"]))
-                    if not pd.isna(row["Conf_ID"])
-                    else int(row["Molregno"])
+                (mrn, ci)
+                for ci, mrn in zip(
+                    input_df[self.conf_id_colunmn].to_numpy(),
+                    input_df[self.molregno_column].to_numpy(),
                 )
-                for index, row in input_df.iterrows()
+                if not pd.isna(ci)
             ]
         else:
-            # Only Molregno is provided
-            ids = input_df["Molregno"].astype(int).tolist()
+            ids = input_df[self.molregno_column].to_list()
 
-        # Call lwreg.retrieve with the list of IDs
         try:
-            retrieval_results = lwreg.retrieve(
-                config=None, ids=ids, as_submitted=self.as_submitted
+            retrieval_results = lwreg.retrieve(config=config, ids=ids)
+        except Exception as e:
+            LOGGER.error(f"Failed to retrieve molecules: {e}")
+            raise ValueError(f"Failed to retrieve molecules: {e}")
+
+        results = []
+        for key, (data, _) in retrieval_results.items():
+            if isinstance(key, tuple):
+                molregno, conf_id = key
+            else:
+                molregno = key
+                conf_id = np.nan
+
+            results.append(
+                {"molregno": molregno, "conf_id": conf_id, "Molecule Data": data}
             )
 
-            # Process retrieval results into a DataFrame
-            results = []
-            for key, (data, fmt) in retrieval_results.items():
-                if isinstance(key, tuple):
-                    molregno, conf_id = key
-                else:
-                    molregno = key
-                    conf_id = np.nan  # If Conf_ID is not available
-
-                results.append(
-                    {"Molregno": molregno, "Conf_ID": conf_id, "Molecule Data": data}
-                )
-
-            # Convert results to a DataFrame
-            results_df = pd.DataFrame(results)
-
-            exec_context.set_progress(1.0, "Molecule retrieval completed.")
-
-            # Return the results as a KNIME table
-            return knext.Table.from_pandas(results_df)
-
-        except Exception as e:
-            LOGGER.error(f"Retrieval failed: {e}")
-            raise ValueError(f"Failed to retrieve molecules: {e}")
+        results_df = pd.DataFrame(results)
+        exec_context.set_progress(1.0, "Molecule retrieval completed.")
+        return knext.Table.from_pandas(results_df)
