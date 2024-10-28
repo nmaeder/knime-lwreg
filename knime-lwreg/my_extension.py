@@ -47,7 +47,7 @@ class LWRegInitNode:
     | tautomer | Tautomer parent of molecule |
 
     """
-  
+
     db_path_input = knext.StringParameter(
         label="Database Path",
         description="Specify the full path to the LWREG database file.",
@@ -137,88 +137,82 @@ class LWRegRegisterNode:
     This node takes an input table of compounds (e.g., SMILES strings) and registers them into the LWReg database.
     """
 
-    # String input to specify the database path
     db_path_input = knext.StringParameter(
         label="Database Path",
-        description="Specify the path to the LWREG database file.",
-        default_value="C:/path/to/your/lwreg_database.sqlt",
+        description="Specify the full path to the LWREG database file.",
+        default_value="lwreg.sqlt",
+    )
+    data_column = knext.ColumnParameter(
+        label="Molecule Data Column",
+        description="Select the column containing the molecule data (SMILES or MolBlock)",
+        port_index=0,
+    )
+    data_format = knext.StringParameter(
+        label="Molecule Format",
+        description="How are the molecules represented?",
+        enum=["SMILES", "MolBlock"],
+        default_value="SMILES",
     )
 
-    # String input to specify the column containing SMILES strings
-    smiles_column = knext.ColumnParameter(
-        label="SMILES Column",
-        description="Select the column containing SMILES strings for registration.",
-        port_index=0,  # Refers to the first input port (input table)
-    )
+    def configure(self, *args):
+        db_path = Path(self.db_path_input)
+        if not db_path.exists():
+            LOGGER.error(f"No database found at {db_path.as_posix()}")
+            raise ValueError(f"No database found at {db_path.as_posix()}")
 
-    def configure(self, configure_context, input_schema):
-        output_schema = knext.Schema.from_columns(
-            [
-                knext.Column(
-                    knext.string(), "SMILES"
-                ),  # SMILES column will be a string
-                knext.Column(
-                    knext.double(), "Compound ID"
-                ),  # Compound ID will also be a string
-                knext.Column(knext.string(), "Status"),  # Status will be a string
-            ]
-        )
-        return output_schema
+        config = utils.configure_from_database(self.db_path_input)
+        output_schema = [
+            knext.Column(knext.double(), "molregno"),
+            knext.Column(knext.string(), "Status"),
+        ]
+        if config["regiterConformers"]:
+            output_schema.insert(1, knext.Column(knext.double(), "conf_id"))
+
+        return knext.Schema.from_columns(output_schema)
 
     def execute(self, exec_context, input_table):
         exec_context.set_progress(0.0, "Registering compounds...")
-
-        # Set the database path configuration for lwreg
-        lwreg.set_default_config({"dbname": self.db_path_input, "dbtype": "sqlite3"})
-
-        # Convert input_table to pandas DataFrame for easier processing
+        config = utils.configure_from_database(self.db_path_input)
+        register_conformers = config["registerConformers"]
         input_df = input_table.to_pandas()
+        mol_data = input_df[self.data_column].to_numpy()
 
-        # Extract SMILES column
-        if self.smiles_column not in input_df.columns:
-            raise ValueError(
-                f"Column '{self.smiles_column}' not found in the input data."
-            )
-        smiles_data = input_df[self.smiles_column]
+        def _register_smiles(data, config):
+            return utils.register(smiles=data, config=config)
 
-        # Create a list to store the registration results
+        def _register_molblock(data, config):
+            return utils.register(molblock=data, config=config)
+
         registration_results = []
-
-        # Register each compound in the LWReg database
-        for idx, smiles in smiles_data.items():
+        registration_func = (
+            _register_smiles if self.data_format == "SMILES" else _register_molblock
+        )
+        for data in mol_data:
             try:
-                # Call the correct `register` function from lwreg.utils
-                compound_id = lwreg.register(smiles=smiles)
-
-                # Check if the compound_id is a failure reason, i.e., an instance of RegistrationFailureReasons
-                if isinstance(compound_id, lwreg.RegistrationFailureReasons):
-                    status = f"Failed: {compound_id.name}"  # Get the name of the failure reason (e.g., PARSE_FAILURE)
-                    registration_results.append(
-                        {
-                            "SMILES": smiles,
-                            "Compound ID": np.nan,  # np.nan does not throw KNIME off regarding data types, as None would.
-                            "Status": status,
-                        }
-                    )
-                else:
-                    status = "Success"
-                    registration_results.append(
-                        {"SMILES": smiles, "Compound ID": compound_id, "Status": status}
-                    )
-
+                keys = registration_func(data, config)
             except Exception as e:
-                LOGGER.error(f"Failed to register compound '{smiles}': {e}")
+                LOGGER.error(f"Failed to register compound '{data}': {e}")
+                result = {"Status": f"Failed: {e}", "molregno": np.nan}
+                if register_conformers:
+                    result["conf_id"] = np.nan
+                registration_results.append(result)
+                continue
 
-                # Handle unexpected exceptions
-                registration_results.append(
-                    {"SMILES": smiles, "Compound ID": np.nan, "Status": f"Failed: {e}"}
-                )
+            if isinstance(keys, utils.RegistrationFailureReasons):
+                result = {"Status": f"Failed: {data}", "molregno": np.nan}
+                if register_conformers:
+                    result |= {"conf_id": np.nan}
+                registration_results.append(result)
+                continue
 
-        # Create a pandas DataFrame with the registration results
-        results_df = pd.DataFrame(registration_results)
+            result = {"Status": "Success"}
+            if register_conformers:
+                result |= {"molregno": keys[0], "conf_id": keys[1]}
+            else:
+                result |= {"molregno": keys}
+            registration_results.append(result)
 
-        # Return the results as a KNIME table
-        return knext.Table.from_pandas(results_df)
+        return knext.Table.from_pandas(pd.DataFrame(registration_results))
 
 
 ########################
